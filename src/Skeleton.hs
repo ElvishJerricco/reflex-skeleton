@@ -19,15 +19,14 @@ module Skeleton
 
 import Control.Concurrent.Chan ( Chan, readChan, newChan )
 import Control.Concurrent ( forkIO, threadDelay, yield )
-import Control.Monad ( forever, void, forM, forM_ )
+import Control.Monad ( forever, void )
 import Control.Monad.IO.Class ( liftIO )
-import Data.Dependent.Sum ( DSum (..) )
-import Data.Functor.Identity ( Identity (..) )
-import Data.IORef ( readIORef )
-import Data.Maybe ( catMaybes )
 import "gtk3" Graphics.UI.Gtk ( AttrOp( (:=) ) )
 import qualified "gtk3" Graphics.UI.Gtk as Gtk
 import System.Glib.Signals ( on )
+
+import Reflex.Main
+import Reflex.PostBuild.Base
 
 -- General Reflex primitives
 import Reflex.Class
@@ -46,11 +45,11 @@ import Reflex.TriggerEvent.Class
 import Reflex.TriggerEvent.Base
 
 -- The `Spider` Reflex engine
-import Reflex.Spider ( runSpiderHost, SpiderTimeline, SpiderHost, Spider )
+import Reflex.Spider ( runSpiderHost, SpiderTimeline, SpiderHost )
 
 -- Some internals from `Spider`.  I should expose these differently, so that
 -- it's not necessary to import any internal modules.
-import Reflex.Spider.Internal ( HasSpiderTimeline, SpiderHostFrame, Global )
+import Reflex.Spider.Internal ( HasSpiderTimeline, SpiderHostFrame )
 
 newtype GuiInputEvent = GuiInputEvent Int deriving Show
 data GuiState = GuiState (Maybe GuiInputEvent) (Maybe String) deriving Show
@@ -231,13 +230,10 @@ runSkeleton inputEventStream outputAction = do
   -- internally to the program, e.g. by newTriggerEvent
   asyncEvents <- newChan
 
-  -- Start the main Reflex engine, which is called `Spider`.  `fireCommand`
-  -- comes from `hostPerformEventT`.
-  ((win, triggerInputEvent), fireCommand) <- runSpiderHost $ do
-
-    -- Add a layer to the monad stack for processing synchronous actions from
-    -- `Event`s, e.g. from performEvent_
-    hostPerformEventT $ do
+  -- Start the main Reflex engine, which is called `Spider`.
+  -- `_fireCommand` and `_eventTID` are return values from
+  -- `runHostWithIO` that aren't needed in this case.
+  ((win, triggerInputEvent), _fireCommand, _eventTID) <- runHostWithIO asyncEvents runSpiderHost (Gtk.postGUISync . runSpiderHost) $ do
 
       -- Add a layer to the monad stack for creating `Event`s to be triggered
       -- from IO later
@@ -251,9 +247,6 @@ runSkeleton inputEventStream outputAction = do
 
         return (win, triggerInputEvent)
 
-  -- Forks a thread to process events through the Reflex engine as they come in
-  processAsyncEvents asyncEvents fireCommand
-
   -- worker thread reading from input channel and trigger the corresponding `Event`
   _ <- forkIO $ forever $ do
     eventValue <- readChan inputEventStream
@@ -266,7 +259,7 @@ runSkeleton inputEventStream outputAction = do
 -- | These instances only work in this program because we know we only invoke
 -- runSpiderHost from the GTK thread; to be more safe, we'd want to wrap
 -- SpiderHost with a newtype that witnesses this fact
-instance HasSpiderTimeline x => MonadGtk (TriggerEventT (SpiderTimeline x) (PerformEventT (SpiderTimeline x) (SpiderHost x))) where
+instance HasSpiderTimeline x => MonadGtk (TriggerEventT (SpiderTimeline x) (PostBuildT (SpiderTimeline x) (PerformEventT (SpiderTimeline x) (SpiderHost x)))) where
   liftGtk = liftIO
 
 -- | See the note on the other MonadGtk instance
@@ -275,16 +268,3 @@ instance HasSpiderTimeline x => MonadGtk (SpiderHostFrame x) where
 
 -- | Lifted from https://github.com/reflex-frp/reflex-dom/blob/c94228143318cad36e145293f7aa3e2d802785f9/reflex-dom-core/src/Reflex/Dom/Main.hs#L291-L300
 -- We can expose this from a more sensible place.
-
-type EventChannel t = Chan [DSum (EventTriggerRef t) TriggerInvocation]
-
-processAsyncEvents :: EventChannel Spider -> FireCommand Spider (SpiderHost Global) -> IO ()
-processAsyncEvents events (FireCommand fire) = void $ forkIO $ forever $ do
-  ers <- readChan events
-  _ <- Gtk.postGUISync $ runSpiderHost $ do
-    mes <- liftIO $ forM ers $ \(EventTriggerRef er :=> TriggerInvocation a _) -> do
-      me <- readIORef er
-      return $ fmap (\e -> e :=> Identity a) me
-    _ <- fire (catMaybes mes) $ return ()
-    liftIO $ forM_ ers $ \(_ :=> TriggerInvocation _ cb) -> cb
-  return ()
